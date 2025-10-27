@@ -80,7 +80,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
+    parser.add_argument("--device", type=str, default=("cuda:0" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")), help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
@@ -100,19 +100,19 @@ if __name__ == "__main__":
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized() and torch.cuda.is_available(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
     ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir='../checkpoints') if args.from_resume==1 else None
-    
+
     # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+    device_type = "cuda" if "cuda" in args.device else ("mps" if "mps" in args.device else "cpu")
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
+    autocast_ctx = nullcontext() if device_type != "cuda" else torch.cuda.amp.autocast(dtype=dtype)
+
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
@@ -121,18 +121,18 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
+
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight)
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     apply_lora(model)
-    
+
     # 统计参数
     total_params = sum(p.numel() for p in model.parameters())
     lora_params_count = sum(p.numel() for name, p in model.named_parameters() if 'lora' in name)
     Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
     Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
-    
+
     # 冻结非LoRA参数，收集LoRA参数
     lora_params = []
     for name, param in model.named_parameters():
@@ -141,13 +141,13 @@ if __name__ == "__main__":
             lora_params.append(param)
         else:
             param.requires_grad = False
-    
+
     # ========== 6. 定义数据和优化器 ==========
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device_type == "cuda" and args.dtype == 'float16'))
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
-    
+
     # ========== 7. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -156,20 +156,21 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
+
     # ========== 8. DDP包模型 ==========
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
-    
+        ddp_kwargs = {"device_ids": [local_rank]} if device_type == "cuda" else {}
+        model = DistributedDataParallel(model, **ddp_kwargs)
+
     # ========== 9. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=(device_type == "cuda"))
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + start_step + 1, lora_params, start_step, wandb)
         else: # 默认从头开始
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
+            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=(device_type == "cuda"))
             train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)

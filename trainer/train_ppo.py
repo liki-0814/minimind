@@ -241,7 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=8e-8, help="Actor学习率")
     parser.add_argument("--critic_learning_rate", type=float, default=8e-8, help="Critic学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
+    parser.add_argument("--device", type=str, default=("cuda:0" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")), help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
@@ -267,19 +267,19 @@ if __name__ == "__main__":
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized() and torch.cuda.is_available(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
+
     # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+    device_type = "cuda" if "cuda" in args.device else ("mps" if "mps" in args.device else "cpu")
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
+    autocast_ctx = nullcontext() if device_type != "cuda" else torch.cuda.amp.autocast(dtype=dtype)
+
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
@@ -288,7 +288,7 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-PPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
+
     # ========== 5. 初始化模型和数据 ==========
     tokenizer = AutoTokenizer.from_pretrained('../model/', padding_side='left')
     moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -314,8 +314,9 @@ if __name__ == "__main__":
     critic_model = critic_model.to(args.device)
     Logger(f'Critic模型总参数量：{sum(p.numel() for p in critic_model.parameters() if p.requires_grad) / 1e6:.3f} M')
     # Reward模型
+    rm_dtype = torch.float16 if device_type == "cuda" else torch.float32
     reward_model = AutoModel.from_pretrained(
-        args.reward_model_path, device_map="cuda", torch_dtype=torch.float32, trust_remote_code=True
+        args.reward_model_path, device_map="auto", torch_dtype=rm_dtype, trust_remote_code=True
     ).to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
     # 数据和优化器
@@ -328,7 +329,7 @@ if __name__ == "__main__":
     total_optimizer_steps = (iters // args.accumulation_steps) * args.epochs
     actor_scheduler = CosineAnnealingLR(actor_optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
     critic_scheduler = CosineAnnealingLR(critic_optimizer, T_max=total_optimizer_steps, eta_min=args.critic_learning_rate / 10)
-    
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -340,26 +341,27 @@ if __name__ == "__main__":
         critic_scheduler.load_state_dict(ckp_data['critic_scheduler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
+
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
         actor_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         critic_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
-        critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])
+        ddp_kwargs = {"device_ids": [local_rank]} if device_type == "cuda" else {}
+        actor_model = DistributedDataParallel(actor_model, **ddp_kwargs)
+        critic_model = DistributedDataParallel(critic_model, **ddp_kwargs)
         old_actor_model.to(args.device)
-    
+
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=(device_type == "cuda"))
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            ppo_train_epoch(epoch, loader, len(loader) + start_step + 1, old_actor_model, ref_model, 
+            ppo_train_epoch(epoch, loader, len(loader) + start_step + 1, old_actor_model, ref_model,
                            actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step, wandb)
         else:  # 默认从头开始
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), 
-                              sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
-            ppo_train_epoch(epoch, loader, len(loader), old_actor_model, ref_model, 
+            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                              sampler=train_sampler, num_workers=args.num_workers, pin_memory=(device_type == "cuda"))
+            ppo_train_epoch(epoch, loader, len(loader), old_actor_model, ref_model,
                            actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb)
